@@ -4,9 +4,11 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from mcp_email_server.emails.models import (
+        ArchiveEmailResponse,
         AttachmentDownloadResponse,
         EmailContentBatchResponse,
         EmailMetadataPageResponse,
+        ForwardEmailResponse,
     )
 
 
@@ -74,4 +76,46 @@ class EmailHandler(abc.ABC):
 
         Returns:
             AttachmentDownloadResponse with download result information.
+        """
+
+    @abc.abstractmethod
+    async def forward_email(
+        self,
+        email_id: str,
+        recipients: list[str],
+        from_address: str | None = None,
+        additional_message: str | None = None,
+        include_attachments: bool = True,
+        mailbox: str = "INBOX",
+    ) -> "ForwardEmailResponse":
+        """
+        Forward an email to new recipients.
+
+        Args:
+            email_id: The UID of the email to forward.
+            recipients: List of recipient email addresses.
+            from_address: Override sender address (uses account default if None).
+            additional_message: Optional message to prepend to the forwarded email.
+            include_attachments: Whether to include original attachments.
+            mailbox: The mailbox containing the email (default: "INBOX").
+
+        Returns:
+            ForwardEmailResponse with forward result information.
+        """
+
+    @abc.abstractmethod
+    async def archive_emails(
+        self,
+        email_ids: list[str],
+        mailbox: str = "INBOX",
+    ) -> "ArchiveEmailResponse":
+        """
+        Archive emails by moving them to the Archive folder.
+
+        Args:
+            email_ids: List of email UIDs to archive.
+            mailbox: The source mailbox (default: "INBOX").
+
+        Returns:
+            ArchiveEmailResponse with archive result information.
         """

@@ -8,20 +8,24 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.policy import default
+from html import escape
 from pathlib import Path
 from typing import Any
 
 import aioimaplib
 import aiosmtplib
+import justhtml
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.models import (
+    ArchiveEmailResponse,
     AttachmentDownloadResponse,
     EmailBodyResponse,
     EmailContentBatchResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
+    ForwardEmailResponse,
 )
 from mcp_email_server.log import logger
 
@@ -630,6 +634,7 @@ class EmailClient:
             port=self.email_server.port,
             start_tls=self.smtp_start_tls,
             use_tls=self.smtp_use_tls,
+            validate_certs=self.email_server.verify_ssl,
         ) as smtp:
             await smtp.login(self.email_server.user_name, self.email_server.password)
 
@@ -673,6 +678,37 @@ class EmailClient:
                         return folder_name
         except Exception as e:
             logger.debug(f"Error finding Sent folder by flag: {e}")
+
+        return None
+
+    async def _find_archive_folder_by_flag(self, imap) -> str | None:
+        """Find the Archive folder by searching for the \\Archive IMAP flag.
+
+        Args:
+            imap: Connected IMAP client
+
+        Returns:
+            The folder name with the \\Archive flag, or None if not found
+        """
+        try:
+            # List all folders - aioimaplib requires reference_name and mailbox_pattern
+            _, folders = await imap.list('""', "*")
+
+            # Search for folder with \Archive flag
+            for folder in folders:
+                folder_str = folder.decode("utf-8") if isinstance(folder, bytes) else str(folder)
+                # IMAP LIST response format: (flags) "delimiter" "name"
+                # Example: (\Archive \HasNoChildren) "/" "Archive"
+                if r"\Archive" in folder_str or "\\Archive" in folder_str:
+                    # Extract folder name from the response
+                    # Split by quotes and get the last quoted part
+                    parts = folder_str.split('"')
+                    if len(parts) >= 3:
+                        folder_name = parts[-2]  # The folder name is the second-to-last quoted part
+                        logger.info(f"Found Archive folder by \\Archive flag: '{folder_name}'")
+                        return folder_name
+        except Exception as e:
+            logger.debug(f"Error finding Archive folder by flag: {e}")
 
         return None
 
@@ -794,6 +830,345 @@ class EmailClient:
                 logger.info(f"Error during logout: {e}")
 
         return deleted_ids, failed_ids
+
+    async def move_to_archive(
+        self, email_ids: list[str], mailbox: str = "INBOX"
+    ) -> tuple[list[str], list[str], str]:
+        """Move emails to the Archive folder.
+
+        Args:
+            email_ids: List of email UIDs to archive.
+            mailbox: The source mailbox (default: "INBOX").
+
+        Returns:
+            Tuple of (archived_ids, failed_ids, archive_folder_name)
+        """
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        archived_ids = []
+        failed_ids = []
+        archive_folder = ""
+
+        # Common Archive folder names across different providers
+        archive_folder_candidates = [
+            "Archive",
+            "INBOX.Archive",
+            "Archives",
+            "[Gmail]/All Mail",
+        ]
+
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await _send_imap_id(imap)
+
+            # Try to find Archive folder by IMAP \Archive flag first
+            flag_folder = await self._find_archive_folder_by_flag(imap)
+            if flag_folder and flag_folder not in archive_folder_candidates:
+                # Add it at the beginning (high priority)
+                archive_folder_candidates.insert(0, flag_folder)
+
+            # Find a valid archive folder
+            for folder in archive_folder_candidates:
+                try:
+                    logger.debug(f"Trying Archive folder: '{folder}'")
+                    result = await imap.select(_quote_mailbox(folder))
+                    status = result[0] if isinstance(result, tuple) else result
+                    if str(status).upper() == "OK":
+                        archive_folder = folder
+                        logger.info(f"Found Archive folder: '{folder}'")
+                        break
+                except Exception as e:
+                    logger.debug(f"Archive folder '{folder}' not available: {e}")
+                    continue
+
+            if not archive_folder:
+                logger.error("Could not find a valid Archive folder")
+                return [], email_ids, ""
+
+            # Select the source mailbox
+            await imap.select(_quote_mailbox(mailbox))
+
+            # Move each email: COPY to archive, then mark as deleted
+            for email_id in email_ids:
+                try:
+                    # Copy to archive folder
+                    copy_result = await imap.uid("copy", email_id, _quote_mailbox(archive_folder))
+                    copy_status = copy_result[0] if isinstance(copy_result, tuple) else copy_result
+                    if str(copy_status).upper() != "OK":
+                        logger.error(f"Failed to copy email {email_id} to archive: {copy_status}")
+                        failed_ids.append(email_id)
+                        continue
+
+                    # Mark as deleted in source mailbox
+                    await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                    archived_ids.append(email_id)
+                except Exception as e:
+                    logger.error(f"Failed to archive email {email_id}: {e}")
+                    failed_ids.append(email_id)
+
+            # Expunge to remove deleted messages from source
+            await imap.expunge()
+
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
+        return archived_ids, failed_ids, archive_folder
+
+    async def get_email_for_forward(
+        self, email_id: str, mailbox: str = "INBOX"
+    ) -> dict[str, Any] | None:
+        """Fetch email content and MIME parts needed for forwarding.
+
+        Args:
+            email_id: The UID of the email to forward.
+            mailbox: The mailbox containing the email.
+
+        Returns:
+            Dictionary with email metadata, body, and attachment MIME parts.
+        """
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await _send_imap_id(imap)
+            await imap.select(_quote_mailbox(mailbox))
+
+            data = await self._fetch_email_with_formats(imap, email_id)
+            if not data:
+                logger.error(f"Failed to fetch UID {email_id} for forwarding")
+                return None
+
+            raw_email = self._extract_raw_email(data)
+            if not raw_email:
+                logger.error(f"Could not find email data for forward, email ID: {email_id}")
+                return None
+
+            # Parse the email
+            parser = BytesParser(policy=default)
+            email_message = parser.parsebytes(raw_email)
+
+            # Extract basic metadata
+            subject = email_message.get("Subject", "")
+            sender = email_message.get("From", "")
+            date_str = email_message.get("Date", "")
+            to_header = email_message.get("To", "")
+            cc_header = email_message.get("Cc", "")
+
+            # Extract body (plain text and HTML) and attachments
+            body = ""
+            html_body = ""
+            attachment_parts: list[MIMEApplication] = []
+
+            if email_message.is_multipart():
+                for part in email_message.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition", ""))
+
+                    if "attachment" in content_disposition:
+                        # Extract attachment as MIME part
+                        filename = part.get_filename()
+                        if filename:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                mime_type = part.get_content_type()
+                                subtype = mime_type.split("/")[1] if "/" in mime_type else "octet-stream"
+                                attachment = MIMEApplication(payload, _subtype=subtype)
+                                attachment.add_header(
+                                    "Content-Disposition",
+                                    "attachment",
+                                    filename=filename,
+                                )
+                                attachment_parts.append(attachment)
+                    elif content_type == "text/plain":
+                        body_part = part.get_payload(decode=True)
+                        if body_part:
+                            charset = part.get_content_charset("utf-8")
+                            try:
+                                body += body_part.decode(charset)
+                            except UnicodeDecodeError:
+                                body += body_part.decode("utf-8", errors="replace")
+                    elif content_type == "text/html":
+                        html_part = part.get_payload(decode=True)
+                        if html_part:
+                            charset = part.get_content_charset("utf-8")
+                            try:
+                                html_body += html_part.decode(charset)
+                            except UnicodeDecodeError:
+                                html_body += html_part.decode("utf-8", errors="replace")
+            else:
+                payload = email_message.get_payload(decode=True)
+                if payload:
+                    charset = email_message.get_content_charset("utf-8")
+                    content_type = email_message.get_content_type()
+                    try:
+                        decoded = payload.decode(charset)
+                    except UnicodeDecodeError:
+                        decoded = payload.decode("utf-8", errors="replace")
+
+                    if content_type == "text/html":
+                        html_body = decoded
+                    else:
+                        body = decoded
+
+            # Use HTML only when there's no plain text alternative
+            # This avoids issues with malformed HTML and spam filters
+            is_html = bool(html_body and not body)
+
+            return {
+                "email_id": email_id,
+                "subject": subject,
+                "from": sender,
+                "to": to_header,
+                "cc": cc_header,
+                "date": date_str,
+                "body": body,
+                "html_body": html_body,
+                "is_html": is_html,
+                "attachment_parts": attachment_parts,
+            }
+
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
+    async def forward_email(
+        self,
+        email_id: str,
+        recipients: list[str],
+        sender: str,
+        additional_message: str | None = None,
+        include_attachments: bool = True,
+        mailbox: str = "INBOX",
+    ) -> dict[str, Any]:
+        """Forward an email to new recipients.
+
+        Args:
+            email_id: The UID of the email to forward.
+            recipients: List of recipient email addresses.
+            sender: The sender address for the forwarded email.
+            additional_message: Optional message to prepend to the forwarded email.
+            include_attachments: Whether to include original attachments.
+            mailbox: The mailbox containing the email.
+
+        Returns:
+            Dictionary with forward result information.
+        """
+        # Get the original email content
+        original = await self.get_email_for_forward(email_id, mailbox)
+        if not original:
+            return {
+                "success": False,
+                "message": f"Could not retrieve email {email_id} for forwarding",
+            }
+
+        # Build the forward subject
+        original_subject = original["subject"]
+        if not original_subject.lower().startswith("fwd:"):
+            forward_subject = f"Fwd: {original_subject}"
+        else:
+            forward_subject = original_subject
+
+        # Determine if original is HTML
+        is_html = original.get("is_html", False)
+        html_body = original.get("html_body", "")
+        plain_body = original.get("body", "")
+
+        # If HTML-only, convert to plain text for fallback
+        if is_html and not plain_body and html_body:
+            plain_body = justhtml.JustHTML(html_body).to_text()
+
+        # Build the message
+        attachment_parts = original.get("attachment_parts", []) if include_attachments else []
+
+        if is_html and html_body:
+            # Build HTML forward
+            quoted_html = "<br><br>---------- Forwarded message ----------<br>"
+            quoted_html += f"From: {escape(original['from'])}<br>"
+            quoted_html += f"Date: {escape(original['date'])}<br>"
+            quoted_html += f"Subject: {escape(original['subject'])}<br>"
+            if original["to"]:
+                quoted_html += f"To: {escape(original['to'])}<br>"
+            if original["cc"]:
+                quoted_html += f"Cc: {escape(original['cc'])}<br>"
+            quoted_html += f"<br>{html_body}"
+
+            if additional_message:
+                forward_html = f"<p>{escape(additional_message)}</p>{quoted_html}"
+            else:
+                forward_html = quoted_html
+
+            if attachment_parts:
+                msg = MIMEMultipart()
+                html_part = MIMEText(forward_html, "html", "utf-8")
+                msg.attach(html_part)
+                for attachment in attachment_parts:
+                    msg.attach(attachment)
+            else:
+                msg = MIMEText(forward_html, "html", "utf-8")
+        else:
+            # Build plain text forward
+            quoted_body = "\n\n---------- Forwarded message ----------\n"
+            quoted_body += f"From: {original['from']}\n"
+            quoted_body += f"Date: {original['date']}\n"
+            quoted_body += f"Subject: {original['subject']}\n"
+            if original["to"]:
+                quoted_body += f"To: {original['to']}\n"
+            if original["cc"]:
+                quoted_body += f"Cc: {original['cc']}\n"
+            quoted_body += "\n"
+            quoted_body += plain_body
+
+            if additional_message:
+                forward_body = additional_message + quoted_body
+            else:
+                forward_body = quoted_body
+
+            if attachment_parts:
+                msg = MIMEMultipart()
+                text_part = MIMEText(forward_body, "plain", "utf-8")
+                msg.attach(text_part)
+                for attachment in attachment_parts:
+                    msg.attach(attachment)
+            else:
+                msg = MIMEText(forward_body, "plain", "utf-8")
+
+        # Set headers
+        if any(ord(c) > 127 for c in forward_subject):
+            msg["Subject"] = Header(forward_subject, "utf-8")
+        else:
+            msg["Subject"] = forward_subject
+
+        if any(ord(c) > 127 for c in sender):
+            msg["From"] = Header(sender, "utf-8")
+        else:
+            msg["From"] = sender
+
+        msg["To"] = ", ".join(recipients)
+        msg["Date"] = email.utils.formatdate(localtime=True)
+
+        # Send via SMTP
+        async with aiosmtplib.SMTP(
+            hostname=self.email_server.host,
+            port=self.email_server.port,
+            start_tls=self.smtp_start_tls,
+            use_tls=self.smtp_use_tls,
+            validate_certs=self.email_server.verify_ssl,
+        ) as smtp:
+            await smtp.login(self.email_server.user_name, self.email_server.password)
+            await smtp.send_message(msg, recipients=recipients)
+
+        return {
+            "success": True,
+            "subject": forward_subject,
+            "message": msg,
+        }
 
 
 class ClassicEmailHandler(EmailHandler):
@@ -928,3 +1303,197 @@ class ClassicEmailHandler(EmailHandler):
             size=result["size"],
             saved_path=result["saved_path"],
         )
+
+    async def archive_emails(
+        self,
+        email_ids: list[str],
+        mailbox: str = "INBOX",
+    ) -> ArchiveEmailResponse:
+        """Archive emails by moving them to the Archive folder.
+
+        Args:
+            email_ids: List of email UIDs to archive.
+            mailbox: The source mailbox (default: "INBOX").
+
+        Returns:
+            ArchiveEmailResponse with archive result information.
+        """
+        archived_ids, failed_ids, archive_folder = await self.incoming_client.move_to_archive(email_ids, mailbox)
+        return ArchiveEmailResponse(
+            archived_ids=archived_ids,
+            failed_ids=failed_ids,
+            archive_folder=archive_folder,
+        )
+
+    async def forward_email(
+        self,
+        email_id: str,
+        recipients: list[str],
+        from_address: str | None = None,
+        additional_message: str | None = None,
+        include_attachments: bool = True,
+        mailbox: str = "INBOX",
+    ) -> ForwardEmailResponse:
+        """Forward an email to new recipients.
+
+        Args:
+            email_id: The UID of the email to forward.
+            recipients: List of recipient email addresses.
+            from_address: Override sender address (uses account default if None).
+            additional_message: Optional message to prepend to the forwarded email.
+            include_attachments: Whether to include original attachments.
+            mailbox: The mailbox containing the email.
+
+        Returns:
+            ForwardEmailResponse with forward result information.
+        """
+        # Determine sender address
+        sender = from_address or f"{self.email_settings.full_name} <{self.email_settings.email_address}>"
+
+        # Get the original email from incoming server (IMAP)
+        original = await self.incoming_client.get_email_for_forward(email_id, mailbox)
+        if not original:
+            return ForwardEmailResponse(
+                original_email_id=email_id,
+                forwarded_to=recipients,
+                from_address=sender,
+                subject="",
+                success=False,
+                message=f"Could not retrieve email {email_id} for forwarding",
+            )
+
+        # Build the forward subject
+        original_subject = original["subject"]
+        if not original_subject.lower().startswith("fwd:"):
+            forward_subject = f"Fwd: {original_subject}"
+        else:
+            forward_subject = original_subject
+
+        # Determine if original is HTML
+        is_html = original.get("is_html", False)
+        html_body = original.get("html_body", "")
+        plain_body = original.get("body", "")
+
+        # For plain text forwarding, prefer converting HTML to clean text
+        # This avoids issues where plain_body contains embedded HTML tags
+        if not is_html and html_body:
+            plain_body = justhtml.JustHTML(html_body).to_text()
+        elif is_html and not plain_body and html_body:
+            # HTML-only email, need plain text fallback
+            plain_body = justhtml.JustHTML(html_body).to_text()
+
+        # Build attachment file paths (we need to temporarily save them for send_email)
+        # For simplicity, we'll send without file attachments and include the attachment parts directly
+        attachment_parts = original.get("attachment_parts", []) if include_attachments else []
+
+        try:
+            if is_html and html_body:
+                # Build HTML forward
+                quoted_html = "<br><br>---------- Forwarded message ----------<br>"
+                quoted_html += f"From: {escape(original['from'])}<br>"
+                quoted_html += f"Date: {escape(original['date'])}<br>"
+                quoted_html += f"Subject: {escape(original['subject'])}<br>"
+                if original["to"]:
+                    quoted_html += f"To: {escape(original['to'])}<br>"
+                if original["cc"]:
+                    quoted_html += f"Cc: {escape(original['cc'])}<br>"
+                quoted_html += f"<br>{html_body}"
+
+                if additional_message:
+                    forward_html = f"<p>{escape(additional_message)}</p>{quoted_html}"
+                else:
+                    forward_html = quoted_html
+
+                if attachment_parts:
+                    msg = MIMEMultipart()
+                    html_part = MIMEText(forward_html, "html", "utf-8")
+                    msg.attach(html_part)
+                    for attachment in attachment_parts:
+                        msg.attach(attachment)
+                else:
+                    msg = MIMEText(forward_html, "html", "utf-8")
+            else:
+                # Build plain text forward
+                quoted_body = "\n\n---------- Forwarded message ----------\n"
+                quoted_body += f"From: {original['from']}\n"
+                quoted_body += f"Date: {original['date']}\n"
+                quoted_body += f"Subject: {original['subject']}\n"
+                if original["to"]:
+                    quoted_body += f"To: {original['to']}\n"
+                if original["cc"]:
+                    quoted_body += f"Cc: {original['cc']}\n"
+                quoted_body += "\n"
+                quoted_body += plain_body
+
+                if additional_message:
+                    forward_body = additional_message + quoted_body
+                else:
+                    forward_body = quoted_body
+
+                if attachment_parts:
+                    msg = MIMEMultipart()
+                    text_part = MIMEText(forward_body, "plain", "utf-8")
+                    msg.attach(text_part)
+                    for attachment in attachment_parts:
+                        msg.attach(attachment)
+                else:
+                    msg = MIMEText(forward_body, "plain", "utf-8")
+
+            # Set headers
+            if any(ord(c) > 127 for c in forward_subject):
+                msg["Subject"] = Header(forward_subject, "utf-8")
+            else:
+                msg["Subject"] = forward_subject
+
+            if any(ord(c) > 127 for c in sender):
+                msg["From"] = Header(sender, "utf-8")
+            else:
+                msg["From"] = sender
+
+            msg["To"] = ", ".join(recipients)
+            msg["Date"] = email.utils.formatdate(localtime=True)
+
+            # Send via SMTP using outgoing server
+            async with aiosmtplib.SMTP(
+                hostname=self.email_settings.outgoing.host,
+                port=self.email_settings.outgoing.port,
+                start_tls=self.email_settings.outgoing.start_ssl,
+                use_tls=self.email_settings.outgoing.use_ssl,
+                validate_certs=self.email_settings.outgoing.verify_ssl,
+            ) as smtp:
+                await smtp.login(
+                    self.email_settings.outgoing.user_name,
+                    self.email_settings.outgoing.password,
+                )
+                await smtp.send_message(msg, recipients=recipients)
+
+            # Save to Sent folder if enabled
+            if self.save_to_sent:
+                try:
+                    await self.outgoing_client.append_to_sent(
+                        msg,
+                        self.email_settings.incoming,
+                        self.sent_folder_name,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to save forwarded email to Sent folder: {e}", exc_info=True)
+
+            return ForwardEmailResponse(
+                original_email_id=email_id,
+                forwarded_to=recipients,
+                from_address=sender,
+                subject=forward_subject,
+                success=True,
+                message=f"Email forwarded successfully to {', '.join(recipients)}",
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to forward email {email_id}: {e}", exc_info=True)
+            return ForwardEmailResponse(
+                original_email_id=email_id,
+                forwarded_to=recipients,
+                from_address=sender,
+                subject=forward_subject if "forward_subject" in dir() else "",
+                success=False,
+                message=f"Failed to forward email: {e!s}",
+            )

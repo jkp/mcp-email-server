@@ -5,8 +5,10 @@ import pytest
 
 from mcp_email_server.app import (
     add_email_account,
+    archive_emails,
     delete_emails,
     download_attachment,
+    forward_email,
     get_emails_content,
     list_available_accounts,
     list_emails_metadata,
@@ -14,11 +16,13 @@ from mcp_email_server.app import (
 )
 from mcp_email_server.config import EmailServer, EmailSettings, ProviderSettings
 from mcp_email_server.emails.models import (
+    ArchiveEmailResponse,
     AttachmentDownloadResponse,
     EmailBodyResponse,
     EmailContentBatchResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
+    ForwardEmailResponse,
 )
 
 
@@ -538,3 +542,162 @@ class TestMcpTools:
             )
 
             assert result.emails[0].message_id == "<test@example.com>"
+
+    @pytest.mark.asyncio
+    async def test_archive_emails(self):
+        """Test archive_emails MCP tool."""
+        mock_handler = AsyncMock()
+        mock_handler.archive_emails.return_value = ArchiveEmailResponse(
+            archived_ids=["12345", "12346"],
+            failed_ids=[],
+            archive_folder="Archive",
+        )
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await archive_emails(
+                account_name="test_account",
+                email_ids=["12345", "12346"],
+            )
+
+            assert isinstance(result, ArchiveEmailResponse)
+            assert result.archived_ids == ["12345", "12346"]
+            assert result.failed_ids == []
+            assert result.archive_folder == "Archive"
+            mock_handler.archive_emails.assert_called_once_with(["12345", "12346"], "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_archive_emails_with_failures(self):
+        """Test archive_emails MCP tool with some failures."""
+        mock_handler = AsyncMock()
+        mock_handler.archive_emails.return_value = ArchiveEmailResponse(
+            archived_ids=["12345"],
+            failed_ids=["12346", "12347"],
+            archive_folder="Archive",
+        )
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await archive_emails(
+                account_name="test_account",
+                email_ids=["12345", "12346", "12347"],
+            )
+
+            assert isinstance(result, ArchiveEmailResponse)
+            assert result.archived_ids == ["12345"]
+            assert result.failed_ids == ["12346", "12347"]
+            assert result.archive_folder == "Archive"
+            mock_handler.archive_emails.assert_called_once_with(["12345", "12346", "12347"], "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_archive_emails_with_mailbox(self):
+        """Test archive_emails MCP tool with custom mailbox."""
+        mock_handler = AsyncMock()
+        mock_handler.archive_emails.return_value = ArchiveEmailResponse(
+            archived_ids=["12345"],
+            failed_ids=[],
+            archive_folder="Archive",
+        )
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await archive_emails(
+                account_name="test_account",
+                email_ids=["12345"],
+                mailbox="Sent",
+            )
+
+            assert isinstance(result, ArchiveEmailResponse)
+            assert result.archived_ids == ["12345"]
+            mock_handler.archive_emails.assert_called_once_with(["12345"], "Sent")
+
+    @pytest.mark.asyncio
+    async def test_forward_email(self):
+        """Test forward_email MCP tool."""
+        mock_handler = AsyncMock()
+        mock_handler.forward_email.return_value = ForwardEmailResponse(
+            original_email_id="12345",
+            forwarded_to=["recipient@example.com"],
+            from_address="Test User <test@example.com>",
+            subject="Fwd: Test Subject",
+            success=True,
+            message="Email forwarded successfully to recipient@example.com",
+        )
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await forward_email(
+                account_name="test_account",
+                email_id="12345",
+                recipients=["recipient@example.com"],
+            )
+
+            assert isinstance(result, ForwardEmailResponse)
+            assert result.original_email_id == "12345"
+            assert result.forwarded_to == ["recipient@example.com"]
+            assert result.subject == "Fwd: Test Subject"
+            assert result.success is True
+            mock_handler.forward_email.assert_called_once_with(
+                email_id="12345",
+                recipients=["recipient@example.com"],
+                from_address=None,
+                additional_message=None,
+                include_attachments=True,
+                mailbox="INBOX",
+            )
+
+    @pytest.mark.asyncio
+    async def test_forward_email_with_options(self):
+        """Test forward_email MCP tool with all options."""
+        mock_handler = AsyncMock()
+        mock_handler.forward_email.return_value = ForwardEmailResponse(
+            original_email_id="12345",
+            forwarded_to=["recipient1@example.com", "recipient2@example.com"],
+            from_address="Custom Sender <custom@example.com>",
+            subject="Fwd: Test Subject",
+            success=True,
+            message="Email forwarded successfully",
+        )
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await forward_email(
+                account_name="test_account",
+                email_id="12345",
+                recipients=["recipient1@example.com", "recipient2@example.com"],
+                from_address="Custom Sender <custom@example.com>",
+                additional_message="Please review this",
+                include_attachments=False,
+                mailbox="Sent",
+            )
+
+            assert isinstance(result, ForwardEmailResponse)
+            assert result.from_address == "Custom Sender <custom@example.com>"
+            assert result.success is True
+            mock_handler.forward_email.assert_called_once_with(
+                email_id="12345",
+                recipients=["recipient1@example.com", "recipient2@example.com"],
+                from_address="Custom Sender <custom@example.com>",
+                additional_message="Please review this",
+                include_attachments=False,
+                mailbox="Sent",
+            )
+
+    @pytest.mark.asyncio
+    async def test_forward_email_failure(self):
+        """Test forward_email MCP tool when forward fails."""
+        mock_handler = AsyncMock()
+        mock_handler.forward_email.return_value = ForwardEmailResponse(
+            original_email_id="12345",
+            forwarded_to=["recipient@example.com"],
+            from_address="Test User <test@example.com>",
+            subject="",
+            success=False,
+            message="Could not retrieve email 12345 for forwarding",
+        )
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await forward_email(
+                account_name="test_account",
+                email_id="12345",
+                recipients=["recipient@example.com"],
+            )
+
+            assert isinstance(result, ForwardEmailResponse)
+            assert result.success is False
+            assert "Could not retrieve email" in result.message
